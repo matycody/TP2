@@ -3,17 +3,18 @@
 """
 Punto 1 (Python) - Análisis sobre `winequality-red.csv`.
 
-Genera: EDA (resumen, matriz de correlación, pairplot), ajustes de modelos
-OLS, Ridge (CV) y Lasso (CV), métricas (MSE, R2), coeficientes y gráficos
-de residuos. Basado en la implementación en R en `punto1.R`.
+Versión centrada en clasificación: EDA (resumen, matriz de correlación, pairplot)
+y Random Forest para clasificación multiclasal con métricas (accuracy, precision,
+recall, f1, ROC AUC), matriz de confusión e importancias de variables.
 
 Para ejecutar (Windows cmd):
     python punto1.py
 o
     py punto1.py
 
-Requiere: pandas, numpy, matplotlib, seaborn, scikit-learn, statsmodels
-Instalar: pip install pandas numpy matplotlib seaborn scikit-learn statsmodels
+Requiere: pandas, numpy, matplotlib, seaborn, scikit-learn
+Opcional: imbalanced-learn (para `RandomOverSampler`)
+Instalar: pip install pandas numpy matplotlib seaborn scikit-learn imbalanced-learn
 """
 
 import os
@@ -26,10 +27,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV
-from sklearn.metrics import mean_squared_error, r2_score
-import statsmodels.api as sm
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, classification_report
+)
+try:
+    from imblearn.over_sampling import RandomOverSampler
+except Exception:
+    RandomOverSampler = None
 
 
 def read_wine(path='winequality-red.csv'):
@@ -67,130 +74,91 @@ def save_corr_and_pairs(df):
 
 
 def fit_and_evaluate(df):
+    # Análisis de regresión removido. Esta función existe solo como placeholder
+    # para mantener compatibilidad si se desea reactivar análisis de regresión.
+    print('Análisis de regresión eliminado en esta versión. Use fit_random_forest para clasificación.')
+
+
+def fit_random_forest(df):
+    """Ajusta Random Forest para clasificación multiclasal sobre `quality`.
+    Guarda métricas (accuracy, precision, recall, f1, auc), matriz de confusión y
+    feature importances en archivos en el directorio actual.
+    """
     if 'quality' not in df.columns:
         raise ValueError('No se encontró la columna `quality` en el dataset')
 
     X = df.drop(columns=['quality'])
-    y = df['quality'].values
+    y = df['quality']
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=1)
+    # Split estratificado
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-    # OLS (statsmodels) para coeficientes en escala original
-    X_train_sm = sm.add_constant(X_train)
-    ols_model = sm.OLS(y_train, X_train_sm).fit()
-
-    # Predicción OLS
-    X_test_sm = sm.add_constant(X_test)
-    y_pred_ols = ols_model.predict(X_test_sm)
-
-    # Regresión lineal (sklearn) como referencia
-    lr = LinearRegression()
-    lr.fit(X_train, y_train)
-    y_pred_lr = lr.predict(X_test)
-
-    # Escalado para modelos penalizados
+    # Escalado (opcional para RF no es obligatorio pero mantenemos consistencia para otros modelos)
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # RidgeCV con grid de alphas
-    alphas = np.logspace(-6, 6, 50)
-    ridge_cv = RidgeCV(alphas=alphas, scoring='neg_mean_squared_error', cv=5)
-    ridge_cv.fit(X_train_s, y_train)
-    y_pred_ridge = ridge_cv.predict(X_test_s)
+    # Balanceo SOLO en training si imblearn está disponible
+    if RandomOverSampler is not None:
+        ros = RandomOverSampler(random_state=42)
+        X_train_bal, y_train_bal = ros.fit_resample(X_train_s, y_train)
+    else:
+        X_train_bal, y_train_bal = X_train_s, y_train
 
-    # LassoCV
-    lasso_cv = LassoCV(alphas=None, cv=5, max_iter=5000, random_state=1)
-    lasso_cv.fit(X_train_s, y_train)
-    y_pred_lasso = lasso_cv.predict(X_test_s)
+    # Ajustar Random Forest
+    rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+    rf.fit(X_train_bal, y_train_bal)
 
-    # Métricas
-    results = []
-    for name, y_pred in [('OLS', y_pred_ols), ('LinearRegression', y_pred_lr),
-                         ('Ridge', y_pred_ridge), ('Lasso', y_pred_lasso)]:
-        mse = mean_squared_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-        results.append({'Modelo': name, 'MSE': mse, 'R2': r2})
+    # Predicciones
+    y_pred = rf.predict(X_test_s)
+    y_proba = rf.predict_proba(X_test_s)
 
-    results_df = pd.DataFrame(results)
-    results_df.to_csv('model_comparison_py.csv', index=False)
+    # Binarizar para AUC multiclase
+    classes = np.sort(df['quality'].unique())
+    try:
+        y_test_bin = label_binarize(y_test, classes=classes)
+        auc = roc_auc_score(y_test_bin, y_proba, average='macro', multi_class='ovr')
+    except Exception:
+        auc = np.nan
 
-    # Guardar coeficientes: OLS (original scale)
-    ols_coefs = pd.DataFrame({'term': ols_model.params.index, 'coef': ols_model.params.values})
-    ols_coefs.to_csv('ols_coefficients_py.csv', index=False)
-
-    # Convertir coef de Ridge y Lasso a escala original
-    def to_original_scale(coef_scaled, intercept_scaled, scaler, X_train_mean):
-        # coef_scaled corresponde a features estandarizadas
-        scale = scaler.scale_
-        mean = X_train_mean
-        coef_orig = coef_scaled / scale
-        intercept_orig = intercept_scaled - np.sum((coef_scaled * mean) / scale)
-        return coef_orig, intercept_orig
-
-    # Ridge
-    ridge_coef_s = ridge_cv.coef_
-    ridge_inter_s = ridge_cv.intercept_
-    ridge_coef_orig, ridge_inter_orig = to_original_scale(ridge_coef_s, ridge_inter_s, scaler, X_train.mean(axis=0))
-    ridge_coefs_df = pd.DataFrame({'term': X.columns, 'coef_scaled': ridge_coef_s, 'coef_orig': ridge_coef_orig})
-    ridge_coefs_df['intercept_orig'] = ridge_inter_orig
-    ridge_coefs_df.to_csv('ridge_coefficients_py.csv', index=False)
-
-    # Lasso
-    lasso_coef_s = lasso_cv.coef_
-    lasso_inter_s = lasso_cv.intercept_
-    lasso_coef_orig, lasso_inter_orig = to_original_scale(lasso_coef_s, lasso_inter_s, scaler, X_train.mean(axis=0))
-    lasso_coefs_df = pd.DataFrame({'term': X.columns, 'coef_scaled': lasso_coef_s, 'coef_orig': lasso_coef_orig})
-    lasso_coefs_df['intercept_orig'] = lasso_inter_orig
-    lasso_coefs_df.to_csv('lasso_coefficients_py.csv', index=False)
-
-    # Gráficos de residuos
-    residuals = {
-        'OLS': y_test - y_pred_ols,
-        'LinearRegression': y_test - y_pred_lr,
-        'Ridge': y_test - y_pred_ridge,
-        'Lasso': y_test - y_pred_lasso,
+    metrics = {
+        'Accuracy': accuracy_score(y_test, y_pred),
+        'Precision_macro': precision_score(y_test, y_pred, average='macro', zero_division=0),
+        'Recall_macro': recall_score(y_test, y_pred, average='macro', zero_division=0),
+        'F1_macro': f1_score(y_test, y_pred, average='macro', zero_division=0),
+        'ROC_AUC_macro': auc
     }
 
-    plt.figure(figsize=(14,4))
-    for i, (name, res) in enumerate(residuals.items(), 1):
-        plt.subplot(1,4,i)
-        sns.histplot(res, kde=True, bins=20)
-        plt.title(f'Resid. {name}')
+    # Guardar métricas
+    metrics_df = pd.DataFrame([metrics])
+    metrics_df.to_csv('rf_classification_metrics_py.csv', index=False)
+
+    # Guardar reporte de clasificación completo
+    report = classification_report(y_test, y_pred, zero_division=0)
+    with open('rf_classification_report.txt', 'w') as f:
+        f.write(report)
+
+    # Matriz de confusión y plot
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes, yticklabels=classes)
+    plt.xlabel('Predicho')
+    plt.ylabel('Real')
+    plt.title('Matriz de confusión - Random Forest')
     plt.tight_layout()
-    plt.savefig('residuals_histograms_py.png')
+    plt.savefig('rf_confusion_matrix_py.png')
     plt.close()
 
-    # Residuals vs Fitted (usar OLS, Ridge, Lasso)
-    plt.figure(figsize=(12,4))
-    plt.subplot(1,3,1)
-    plt.scatter(y_pred_ols, residuals['OLS'], s=20)
-    plt.axhline(0, linestyle='--', color='gray')
-    plt.title('OLS: Ajustado vs Residuo')
-    plt.subplot(1,3,2)
-    plt.scatter(y_pred_ridge, residuals['Ridge'], s=20)
-    plt.axhline(0, linestyle='--', color='gray')
-    plt.title('Ridge: Ajustado vs Residuo')
-    plt.subplot(1,3,3)
-    plt.scatter(y_pred_lasso, residuals['Lasso'], s=20)
-    plt.axhline(0, linestyle='--', color='gray')
-    plt.title('Lasso: Ajustado vs Residuo')
-    plt.tight_layout()
-    plt.savefig('residuals_vs_fitted_py.png')
-    plt.close()
+    # Importancias de características
+    fi = pd.DataFrame({'feature': X.columns, 'importance': rf.feature_importances_}).sort_values('importance', ascending=False)
+    fi.to_csv('rf_feature_importances_py.csv', index=False)
 
-    # Información adicional: alphas
-    extra = {
-        'ridge_alpha': ridge_cv.alpha_,
-        'lasso_alpha': lasso_cv.alpha_
-    }
-    extra_df = pd.DataFrame([extra])
-    extra_df.to_csv('model_alphas_py.csv', index=False)
-
-    print('\nResultados guardados en archivos CSV/PNG en el directorio actual.')
-    print(results_df)
-    print('\nRidge alpha elegido:', ridge_cv.alpha_)
-    print('Lasso alpha elegido:', lasso_cv.alpha_)
+    # Mostrar por consola resumen
+    print('\nRandom Forest - métricas:')
+    print(metrics_df.T)
+    print('\nClassification report guardado en rf_classification_report.txt')
+    print('Feature importances guardadas en rf_feature_importances_py.csv')
 
 
 def main():
@@ -205,6 +173,8 @@ def main():
 
     print('\nAjustando modelos y evaluando...')
     fit_and_evaluate(df)
+    print('\nAjustando Random Forest (clasificación) y calculando métricas...')
+    fit_random_forest(df)
 
 
 if __name__ == '__main__':
